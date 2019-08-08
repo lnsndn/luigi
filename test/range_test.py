@@ -25,7 +25,8 @@ from luigi.mock import MockTarget, MockFileSystem
 from luigi.tools.range import (RangeDaily, RangeDailyBase, RangeEvent,
                                RangeHourly, RangeHourlyBase,
                                RangeByMinutes, RangeByMinutesBase,
-                               _constrain_glob, _get_filesystems_and_globs, RangeMonthly)
+                               _constrain_glob, _get_filesystems_and_globs,
+                               RangeMonthly, RangeYearly)
 
 
 class CommonDateMinuteTask(luigi.Task):
@@ -54,6 +55,13 @@ class CommonMonthTask(luigi.Task):
 
     def output(self):
         return MockTarget(self.m.strftime('/n2000y01a05n/%Y_%maww/21mm01dara21/ooo'))
+
+
+class CommonYearTask(luigi.Task):
+    y = luigi.YearParameter()
+
+    def output(self):
+        return MockTarget(self.y.strftime('/n2000y01a05n/%Y_aww/21mm01dara21/ooo'))
 
 
 task_a_paths = [
@@ -830,6 +838,234 @@ class FilesystemInferenceTest(unittest.TestCase):
         self.assertRaises(NotImplementedError, test_raise_not_implemented)
 
 
+class RangeYearlyTest(unittest.TestCase):
+
+    def setUp(self):
+        # yucky to create separate callbacks; would be nicer if the callback
+        # received an instance of a subclass of Event, so one callback could
+        # accumulate all types
+        @RangeYearly.event_handler(RangeEvent.DELAY)
+        def callback_delay(*args):
+            self.events.setdefault(RangeEvent.DELAY, []).append(args)
+
+        @RangeYearly.event_handler(RangeEvent.COMPLETE_COUNT)
+        def callback_complete_count(*args):
+            self.events.setdefault(RangeEvent.COMPLETE_COUNT, []).append(args)
+
+        @RangeYearly.event_handler(RangeEvent.COMPLETE_FRACTION)
+        def callback_complete_fraction(*args):
+            self.events.setdefault(RangeEvent.COMPLETE_FRACTION, []).append(args)
+
+        self.events = {}
+
+    def _empty_subcase(self, kwargs, expected_events):
+        calls = []
+
+        class RangeYearlyDerived(RangeYearly):
+            def missing_datetimes(self, task_cls, finite_datetimes):
+                args = [self, task_cls, finite_datetimes]
+                calls.append(args)
+                return args[-1][:5]
+
+        task = RangeYearlyDerived(of=CommonYearTask, **kwargs)
+        self.assertEqual(task.requires(), [])
+        self.assertEqual(calls, [])
+        self.assertEqual(task.requires(), [])
+        self.assertEqual(calls, [])  # subsequent requires() should return the cached result, never call missing_datetimes
+        self.assertEqual(self.events, expected_events)
+        self.assertTrue(task.complete())
+
+    def test_stop_before_years_back(self):
+        # nothing to do because stop is earlier than back
+        self._empty_subcase(
+            {
+                'now': datetime_to_epoch(datetime.datetime(2019, 8, 1)),
+                'stop': datetime.date(2010, 3, 1),
+                'years_back': 2,
+                'years_forward': 7,
+                'reverse': True,
+            },
+            {
+                'event.tools.range.delay': [
+                    ('CommonYearTask', 0),
+                ],
+                'event.tools.range.complete.count': [
+                    ('CommonYearTask', 0),
+                ],
+                'event.tools.range.complete.fraction': [
+                    ('CommonYearTask', 1.),
+                ],
+            }
+        )
+
+    def test_start_after_years_forward(self):
+        # nothing to do because start is later
+        self._empty_subcase(
+            {
+                'now': datetime_to_epoch(datetime.datetime(2000, 1, 1)),
+                'start': datetime.datetime(2014, 3, 1),
+                'years_back': 4,
+                'years_forward': 6,
+            },
+            {
+                'event.tools.range.delay': [
+                    ('CommonYearTask', 0),
+                ],
+                'event.tools.range.complete.count': [
+                    ('CommonYearTask', 0),
+                ],
+                'event.tools.range.complete.fraction': [
+                    ('CommonYearTask', 1.),
+                ],
+            }
+        )
+
+    def _nonempty_subcase(self, kwargs, expected_finite_datetimes_range, expected_requires, expected_events):
+        calls = []
+
+        class RangeYearlyDerived(RangeYearly):
+            def missing_datetimes(self, finite_datetimes):
+                calls.append((self, finite_datetimes))
+                return finite_datetimes[:7]
+
+        task = RangeYearlyDerived(of=CommonYearTask, **kwargs)
+        self.assertEqual(list(map(str, task.requires())), expected_requires)
+        self.assertEqual((min(calls[0][1]), max(calls[0][1])), expected_finite_datetimes_range)
+        self.assertEqual(list(map(str, task.requires())), expected_requires)
+        self.assertEqual(len(calls), 1)  # subsequent requires() should return the cached result, not call missing_datetimes again
+        self.assertEqual(self.events, expected_events)
+        self.assertFalse(task.complete())
+
+    def test_start_long_before_years_back(self):
+        now_year = 2000
+        start_year = 1970
+        back = 5
+        forward = 4
+        total = now_year - start_year + forward
+        self._nonempty_subcase(
+            {
+                'now': datetime_to_epoch(datetime.datetime(now_year, 1, 1)),
+                'start': datetime.datetime(start_year, 1, 1),
+                'years_back': back,
+                'years_forward': forward,
+            },
+            (datetime.datetime(1995, 1, 1), datetime.datetime(2003, 1, 1)),
+            [
+                'CommonYearTask(y=1995)',
+                'CommonYearTask(y=1996)',
+                'CommonYearTask(y=1997)',
+                'CommonYearTask(y=1998)',
+                'CommonYearTask(y=1999)',
+                'CommonYearTask(y=2000)',
+                'CommonYearTask(y=2001)',
+            ],
+            {
+                'event.tools.range.delay': [
+                    ('CommonYearTask', back + forward),
+                ],
+                'event.tools.range.complete.count': [
+                    ('CommonYearTask', total - back - 2),
+                ],
+                'event.tools.range.complete.fraction': [
+                    ('CommonYearTask', (total - back - 2) / total),
+                ],
+            }
+        )
+
+    def test_start_after_long_years_back(self):
+        total = 2016 - 2006
+        self._nonempty_subcase(
+            {
+                'now': datetime_to_epoch(datetime.datetime(2016, 11, 22)),
+                'start': datetime.datetime(2006, 1, 1),
+                'task_limit': 3,
+                'years_back': 20,
+            },
+            (datetime.datetime(2006, 1, 1), datetime.datetime(2015, 1, 1)),
+            [
+                'CommonYearTask(y=2006)',
+                'CommonYearTask(y=2007)',
+                'CommonYearTask(y=2008)',
+            ],
+            {
+                'event.tools.range.delay': [
+                    ('CommonYearTask', total),
+                ],
+                'event.tools.range.complete.count': [
+                    ('CommonYearTask', 3),
+                ],
+                'event.tools.range.complete.fraction': [
+                    ('CommonYearTask', 3.0 / total),
+                ],
+            }
+        )
+
+    def test_start_long_before_long_years_back_and_with_long_years_forward(self):
+        total = 2025 - 2011
+        self._nonempty_subcase(
+            {
+                'now': datetime_to_epoch(datetime.datetime(2017, 10, 22, 12, 4, 29)),
+                'start': datetime.date(2011, 3, 20),
+                'stop': datetime.date(2025, 1, 29),
+                'task_limit': 4,
+                'years_back': 3,
+                'years_forward': 3,
+            },
+            (datetime.datetime(2014, 1, 1), datetime.datetime(2019, 1, 1)),
+            [
+                'CommonYearTask(y=2014)',
+                'CommonYearTask(y=2015)',
+                'CommonYearTask(y=2016)',
+                'CommonYearTask(y=2017)',
+            ],
+            {
+                'event.tools.range.delay': [
+                    ('CommonYearTask', 2025 - 2014),
+                ],
+                'event.tools.range.complete.count': [
+                    # this is how many complete methods are checked before the task limit is enforced
+                    # but after the back and forward limits
+                    ('CommonYearTask', total - 6),
+                ],
+                'event.tools.range.complete.fraction': [
+                    ('CommonYearTask', (total - 6.0) / total),
+                ],
+            }
+        )
+
+    def test_zero_years_forward(self):
+        total = 2017 - 2011
+        self._nonempty_subcase(
+            {
+                'now': datetime_to_epoch(datetime.datetime(2017, 10, 1)),
+                'start': datetime.date(2011, 10, 1),
+                'task_limit': 10,
+                'years_back': 2,
+            },
+            (datetime.datetime(2015, 1, 1), datetime.datetime(2016, 1, 1)),
+            [
+                'CommonYearTask(y=2015)',
+                'CommonYearTask(y=2016)',
+            ],
+            {
+                'event.tools.range.delay': [
+                    ('CommonYearTask', 2),
+                ],
+                'event.tools.range.complete.count': [
+                    ('CommonYearTask', total - 2),
+                ],
+                'event.tools.range.complete.fraction': [
+                    ('CommonYearTask', (total - 2.0) / total),
+                ],
+            }
+        )
+
+    def test_consistent_formatting(self):
+        task = RangeYearly(of=CommonYearTask, start=datetime.date(2016, 1, 1))
+        self.assertEqual(task._format_range([datetime.datetime(2017, 2, 1), datetime.datetime(2019, 4, 5, 21)]),
+                         '[2017, 2019]')
+
+
 class RangeMonthlyTest(unittest.TestCase):
 
     def setUp(self):
@@ -1086,6 +1322,47 @@ class RangeMonthlyTest(unittest.TestCase):
                             start=datetime.date(2018, 1, 4))
         self.assertEqual(task._format_range([datetime.datetime(2018, 2, 3, 14), datetime.datetime(2018, 4, 5, 21)]),
                          '[2018-02, 2018-04]')
+
+
+class YearInstantiationTest(LuigiTestCase):
+
+    def test_old_year_instantiation(self):
+        """
+        Verify that you can still programmatically set of param as string
+        """
+        class MyTask(luigi.Task):
+            year_param = luigi.YearParameter()
+
+            def complete(self):
+                return False
+
+        range_task = RangeYearly(now=datetime_to_epoch(datetime.datetime(2015, 12, 2)),
+                                 of=MyTask,
+                                 start=datetime.date(2014, 1, 1),
+                                 stop=datetime.date(2016, 1, 1))
+        expected_task = MyTask(year_param=datetime.date(2014, 1, 1))
+        self.assertEqual(expected_task, list(range_task._requires())[0])
+
+    def test_year_cli_instantiation(self):
+        """
+        Verify that you can still use Range through CLI
+        """
+        class MyTask(luigi.Task):
+            task_namespace = "wohoo"
+            year_param = luigi.YearParameter()
+            secret = 'some-value-to-sooth-python-linters'
+            comp = False
+
+            def complete(self):
+                return self.comp
+
+            def run(self):
+                self.comp = True
+                MyTask.secret = 'yay'
+
+        now = str(int(datetime_to_epoch(datetime.datetime(2015, 12, 2))))
+        self.run_locally_split('RangeYearly --of wohoo.MyTask --now {now} --start 2014 --stop 2016'.format(now=now))
+        self.assertEqual(MyTask(year_param=datetime.date(2015, 1, 1)).secret, 'yay')
 
 
 class MonthInstantiationTest(LuigiTestCase):
@@ -1377,10 +1654,10 @@ class RangeHourlyTest(unittest.TestCase):
                 new=mock_exists_always_false)
     def test_missing_directory(self):
         task = RangeHourly(now=datetime_to_epoch(
-                           datetime.datetime(2014, 4, 1)),
-                           of=TaskC,
-                           start=datetime.datetime(2014, 3, 20, 23),
-                           stop=datetime.datetime(2014, 3, 21, 1))
+            datetime.datetime(2014, 4, 1)),
+            of=TaskC,
+            start=datetime.datetime(2014, 3, 20, 23),
+            stop=datetime.datetime(2014, 3, 21, 1))
         self.assertFalse(task.complete())
         expected = [
             'TaskC(dh=2014-03-20T23)',
@@ -1497,11 +1774,11 @@ class RangeByMinutesTest(unittest.TestCase):
                 new=mock_exists_always_false)
     def test_missing_directory(self):
         task = RangeByMinutes(now=datetime_to_epoch(
-                           datetime.datetime(2014, 3, 21, 0, 0)),
-                           of=TaskMinutesC,
-                           start=datetime.datetime(2014, 3, 20, 23, 11),
-                           stop=datetime.datetime(2014, 3, 20, 23, 21),
-                           minutes_interval=5)
+            datetime.datetime(2014, 3, 21, 0, 0)),
+            of=TaskMinutesC,
+            start=datetime.datetime(2014, 3, 20, 23, 11),
+            stop=datetime.datetime(2014, 3, 20, 23, 21),
+            minutes_interval=5)
         self.assertFalse(task.complete())
         expected = [
             'TaskMinutesC(dm=2014-03-20T2315)',

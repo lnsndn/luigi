@@ -647,6 +647,73 @@ def infer_bulk_complete_from_fs(datetimes, datetime_to_task, datetime_to_re):
     return missing_datetimes
 
 
+class RangeYearly(RangeBase):
+    start = luigi.YearParameter(
+        default=None,
+        description="beginning year, inclusive. Default: None - work backward forever (requires reverse=True)")
+    stop = luigi.YearParameter(
+        default=None,
+        description="ending year, exclusive. Default: None - work forward forever")
+    years_back = luigi.IntParameter(
+        default=2,
+        description=("extent to which contiguousness is to be assured into "
+                     "past, in years from current time. Prevents infinite loop "
+                     "when start is none. If the dataset has limited retention"
+                     " (i.e. old outputs get removed), this should be set "
+                     "shorter to that, too, to prevent the oldest outputs "
+                     "flapping. Increase freely if you intend to process old "
+                     "dates - worker's memory is the limit"))
+    years_forward = luigi.IntParameter(
+        default=0,
+        description="extent to which contiguousness is to be assured into future, in years from current time. "
+                    "Prevents infinite loop when stop is none")
+
+    def datetime_to_parameter(self, dt):
+        return date(dt.year, 1, 1)
+
+    def parameter_to_datetime(self, p):
+        return datetime(p.year, 1, 1)
+
+    def datetime_to_parameters(self, dt):
+        """
+        Given a date-time, will produce a dictionary of of-params combined with the ranged task parameter
+        """
+        return self._task_parameters(dt.date())
+
+    def parameters_to_datetime(self, p):
+        """
+        Given a dictionary of parameters, will extract the ranged task parameter value
+        """
+        dt = p[self._param_name]
+        return datetime(dt.year, 1, 1)
+
+    def _format_datetime(self, dt):
+        return dt.strftime('%Y')
+
+    def _align(self, dt):
+        return datetime(dt.year, 1, 1)
+
+    def moving_start(self, now):
+        return self._align(now) - relativedelta(years=self.years_back)
+
+    def moving_stop(self, now):
+        return self._align(now) + relativedelta(years=self.years_forward)
+
+    def finite_datetimes(self, finite_start, finite_stop):
+        """
+        Simply returns the points in time that correspond to end of year
+        """
+        start_date = self._align(finite_start)
+        aligned_stop = self._align(finite_stop)
+        dates = []
+        for m in itertools.count():
+            t = start_date + relativedelta(years=m)
+            if t >= aligned_stop:
+                return dates
+            if t >= finite_start:
+                dates.append(t)
+
+
 class RangeMonthly(RangeBase):
     """
     Produces a contiguous completed range of a monthly recurring task.
